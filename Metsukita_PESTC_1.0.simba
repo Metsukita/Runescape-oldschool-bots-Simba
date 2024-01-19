@@ -1,0 +1,371 @@
+{$DEFINE SRL_USE_REMOTEINPUT}
+{$DEFINE SCRIPT_GUI}
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+{$I WaspLib/osr/handlers/combathandler.simba}
+
+begin
+  Login.PlayerIndex := 0;
+end;
+
+type
+  EState = (
+    WAIT_STATE,
+    HEAL_PLAYER,
+    ENTER_BOAT,
+    WALK_CENTER,
+    ATTACK,
+    IN_COMBAT
+
+  );
+
+  TPestControl = record(TBaseWalkerScript)
+    State: EState;
+    Center: TPoint;
+    CombatLevel: Int32;
+    PCLevel: Int32;
+    PCPlank: TRSObject;
+    BoatPoly: TPointArray;
+    OnTower: Boolean;
+  end;
+
+
+procedure TPestControl.SetupDifficulty();
+begin
+  CombatLevel := Combat.GetCombatLevel;
+
+  case CombatLevel of
+    40..69:
+      begin
+        PCPlank := RSObjects.PestControlNovicePlank;   //planks hard to easy [[6127, 4699], [6152, 4736], [6211, 4756]];
+        PCLevel := 0;
+        BoatPoly := [[6215, 4738], [6215, 4763], [6233, 4763], [6233, 4738]];
+      end;
+
+    70..99:
+      begin
+        PCPlank := RSObjects.PestControlIntermidiatePlank;
+        PCLevel := 1;
+        BoatPoly := [[6128, 4721], [6145, 4721], [6145, 4748], [6128, 4748]];
+      end;
+
+    100..126:
+      begin
+        PCPlank := RSObjects.PestControlVeteranPlank;
+        PCLevel := 2;
+        BoatPoly := [[6104, 4693], [6121, 4693], [6121, 4721], [6104, 4721]];
+      end;
+
+
+  end;
+end;
+
+procedure TAntiban.Setup(); override;
+begin
+  Antiban.Skills := [ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+  Antiban.MinZoom := 0;
+  Antiban.MaxZoom := 15;
+  inherited;
+end;
+
+procedure TPestControl.Init(maxActions: UInt32; maxTime: UInt64); override;
+begin
+  if Login.Players = [] then
+    Login.AddPlayer('','');
+  Login.Players[Login.PlayerIndex].Worlds := [344]; //override world to Pest control world
+
+  inherited;
+
+  Self.RSW.Setup([RSRegions.PEST_CONTROL_ISLAND, RSRegions.PEST_CONTROL_OUTPOST]);
+  Self.Center := [5760, 5688];
+
+  RSMonsters.AnyMonster.UpText := ['Attack'];
+  RSMonsters.AnyMonster.Setup(150, 5, [Self.Center]);
+  RSMonsters.AnyMonster.DotFilter.Setup([5752, 5625, 3], False);
+  RSMonsters.AnyMonster.Filter.MinimapDot := True;
+  RSMonsters.AnyMonster.Filter.UpText := True;
+  CombatHandler.Setup(RSMonsters.AnyMonster, 1200);
+
+  Self.SetupDifficulty();
+end;
+
+
+function TPestControl.InIsland(Pos: TPoint): Boolean;
+begin
+  Result := Pos.Y > 5000;
+
+  if Result then
+    CombatHandler.InCombatTimer.Resume
+  else
+    CombatHandler.InCombatTimer.Timeout := GetTickCount;
+end;
+
+function TPestControl.InBoat(Pos: TPoint): Boolean;
+begin
+  Result := SRL.PointInPoly(Pos, BoatPoly);
+end;
+
+
+function TPestControl.EnterBoat(): Boolean;
+begin
+  if PCPlank.WalkClick() then
+  begin
+    Minimap.WaitMoving();
+    Result := WaitUntil(Self.InBoat(Self.RSW.GetMyPos), 100, 10000);
+  end;
+end;
+
+function TPestControl.PlayerLowHP(): Boolean;
+begin
+  Result := (MainScreen.IsClassicOpen and (Minimap.GetHPPercent <= 60)) or
+                       (Minimap.GetHPPercent <= 60);
+end;
+
+function TPestControl.Heal(): Boolean;
+var
+  MinPercent: Int32 := Random(60, 90);
+begin
+  repeat
+    if not Inventory.Consume(ERSConsumable.FOOD) then
+      Exit;
+    Wait(300, 500);
+  until Result := (Minimap.GetHPPercent >= MinPercent);
+end;
+
+function TPestControl.WalkSpot(): Boolean;
+var
+  TPA: TPointArray := PopulateTile(Center, 2);
+begin
+  Result := Self.RSW.WebWalk(TPA, 8, 0.2);
+end;
+
+function TPestControl.GetState(): EState;
+var
+  me: TPoint := Self.RSW.GetMyPos();
+begin
+
+  if Self.InIsland(me) then
+  begin
+    if Self.PlayerLowHP() and Inventory.ContainsAny(FOOD_ARRAY) then
+      Exit(EState.HEAL_PLAYER);
+
+    if me.Y > 5653 then
+    begin
+
+      if not MainScreen.WaitInCombat(1200) then
+        Exit(EState.ATTACK);
+
+      Exit(EState.IN_COMBAT);
+    end;
+
+    Exit(EState.WALK_CENTER);
+  end;
+
+
+
+  if Self.InBoat(me) then
+    Exit(EState.WAIT_STATE);
+
+  Exit(EState.ENTER_BOAT);
+end;
+
+procedure TPestControl.Run(maxActions: UInt32; maxTime: UInt64);
+begin
+  Self.Init(maxActions, maxTime);
+
+  repeat
+    Self.State := Self.GetState();
+    Self.SetAction(ToStr(Self.State));
+
+    case Self.State of
+      EState.WAIT_STATE: Wait(500, 800);
+      EState.HEAL_PLAYER:   Self.Heal();
+      ENTER_BOAT:           Self.EnterBoat();
+      EState.WALK_CENTER:   Self.WalkSpot();
+      EState.ATTACK:        CombatHandler.WalkAttackMonster(1);
+      EState.IN_COMBAT:     MainScreen.WaitInCombat(1200);
+
+    end;
+
+    Self.DoAntiban();
+  until Self.ShouldStop();
+end;
+
+var
+  PestControl: TPestControl;
+
+function TRSMainScreen.InCombat(): Boolean; override;
+begin
+  Result := inherited;
+
+  if Result then WL.Activity.Restart();
+end;
+
+function TRSCombatHandler.WaitHitSplats(): Boolean; override;
+var
+  t: UInt64;
+  i: Int32;
+  tmp, splats: TRSHitsplatArray;
+  b: TBox;
+begin
+  t := GetTickCount() + 3000;
+  b := MainScreen.GetPlayerBox();
+
+  repeat
+    if not PestControl.InIsland(PestControl.RSW.GetMyPos()) then
+      Exit;
+
+    tmp := MainScreen.FindHitsplats();
+
+    for i := 0 to High(tmp) do
+      if not b.Contains(tmp[i].Position) then
+        splats += tmp[i];
+
+    Result := splats <> [];
+    if Result then
+      Break;
+  until GetTickCount() > t;
+
+  if Result then
+  begin
+    Self.MonsterWalkerCoord := Self.GetMonsterDot(splats[0].Position);
+    Self.IsFighting := True;
+    Self.DoingSpec := False;
+    Self.InCombatTimer.Restart(Random(0, 1000)); //alterei o tempo
+  end;
+end;
+
+
+function TWebGraph.PathBetween(p,q: TPoint; Rnd:Double=0): TPointArray; constref; override;
+var
+  n1,n2: Int32;
+  nodes: TIntegerArray;
+begin
+  n1 := Self.FindNearestNode(p);
+  n2 := Self.FindNearestNode(q);
+  if (n1 <> n2) then
+  begin
+    nodes := Self.FindPath(n1,n2,Rnd);
+    if (Length(nodes) = 0) then
+      Exit;
+  end;
+  // if distance between nodes > ??? then Unreliable result
+
+  Result += p;
+  Result += NodesToPoints(nodes);
+  Result += q;
+end;
+
+function TRSWalkerObject._SelectHelper(action: TStringArray): Boolean;  override;
+begin
+  if TRSWalkerObject.CurrentUpText <> [] then
+    TRSWalkerObject.CurrentUpText := [];
+
+  if TRSWalkerObject.RedClicked then
+  begin
+    TRSWalkerObject.RedClicked := False;
+    Exit(True);
+  end;
+
+  if ChooseOption.IsOpen() and ChooseOption.Select(action) then
+    Exit(True);
+
+  if MainScreen.IsUpText(action) then
+  begin
+    Mouse.Click(MOUSE_LEFT);
+    Exit(MainScreen.DidRedClick());
+  end;
+
+  Result := False;
+end;
+
+function TRSWalker.Click(MinimapPoint: TPoint; Randomness: Int32): Boolean; override;
+var
+  P: TPoint;
+begin
+  Result := True;
+
+  if Self.ScreenWalk then
+  begin
+    Mouse.Move(Minimap.PointToMsRect(MinimapPoint).Mean);
+
+    if not MainScreen.IsUpText(['Walk here', 'Chop', 'Attack']) then
+      Exit(ChooseOption.Select('Walk here'));
+  end else
+  begin
+    P := MinimapPoint.Random(-Randomness, Randomness);
+    while not Minimap.IsPointOn(P) do
+      P := MinimapPoint.Random(-Randomness, Randomness);
+
+    Mouse.Move(P);
+  end;
+
+  Mouse.Click(MOUSE_LEFT);
+
+  // 15% chance of spam clicking
+  if (Randomness > 0) and (Random() < 0.15) then
+    for 0 to Random(3) do
+    begin
+      Mouse.Click(Mouse.Position(), MOUSE_LEFT);
+
+      Wait(0, 150, wdLeft);
+    end;
+end;
+
+{$IFDEF SCRIPT_GUI}
+type
+  TPestControlConfig = record(TScriptForm)
+    InfoBox: TLabel;
+  end;
+
+procedure TPestControlConfig.StartScript(sender: TObject); override;
+begin
+  //FoodManager.MinInvPoints := 20;
+  //CurrentTask := ETask(Selector.Combobox.getItemIndex());
+
+  //MaxActions := StrToInt(Self.ActionLimit.getText());
+  //MaxTime    := StrToInt64(Self.TimeLimit.getText());
+  inherited;
+end;
+
+procedure TPestControlConfig.Run(); override;
+var
+  tab: TTabSheet;
+begin
+  Self.Setup('Wasp Pest Control');
+  Self.Start.setOnClick(@Self.StartScript);
+
+  Self.AddTab('Script Settings');
+  tab := Self.Tabs[High(Self.Tabs)];
+
+  Self.CreateAccountManager(tab);
+
+  with InfoBox do
+  begin
+    Create(tab);
+    SetCaption(
+      'Using a ranged weapon is recommended.' + STR_NEW_LINE +
+      'This will use your quick prayers, make sure you set them up in advance.'
+    );
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(180));
+  end;
+
+  Self.CreateVersionPanel(tab);
+  Self.CreateAlchemyPanel();
+  Self.CreateAntibanManager();
+  Self.CreateWaspLibSettings();
+  Self.CreateAPISettings();
+
+  inherited;
+end;
+
+var
+  PestControlConfig: TPestControlConfig;
+{$ENDIF}
+begin
+  {$IFDEF SCRIPT_GUI}
+  PestControlConfig.Run();
+  {$ENDIF}
+  PestControl.Run(WLSettings.MaxActions, WLSettings.MaxTime);
+end.
